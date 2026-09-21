@@ -18,6 +18,7 @@ log_request() call below if you don't want that.
 from __future__ import annotations
 
 import csv
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ import streamlit as st
 from zip_lookup_core import (
     TERRITORY_STATES,
     build_geocoder,
+    email_domain_hint,
     load_cache,
     lookup_zip,
     save_cache,
@@ -38,6 +40,9 @@ LOG_FILE = "request_log.csv"
 LOG_COLUMNS = ["timestamp_utc", "name", "email", "school_name", "territory", "country", "zip_code"]
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("streamlit_app")
 
 st.set_page_config(page_title="School ZIP Code Lookup", page_icon="📍")
 
@@ -74,8 +79,11 @@ def log_request(name: str, email: str, school_name: str, territory: str, country
 st.title("📍 School ZIP Code Lookup")
 st.caption(
     "Enter a school's name, country, and sales territory to look up its ZIP "
-    "code. Lookups are powered by OpenStreetMap (Nominatim); your name and "
-    "email are saved with each request."
+    "code. Lookups are powered by OpenStreetMap (Nominatim). If your email "
+    "is an institutional address (e.g. a school/district domain, not "
+    "gmail/yahoo/etc.), its domain is also used as an extra hint — this "
+    "helps most for US school districts using a `*.k12.<state>.us` domain. "
+    "Your name and email are saved with each request."
 )
 
 territory_options = ["(none / unknown)"] + sorted(TERRITORY_STATES.keys())
@@ -113,21 +121,43 @@ if submitted:
             st.error(e)
     else:
         territory_value = "" if territory == "(none / unknown)" else territory
-        geocode, reverse = get_geocoder()
-        cache = get_cache()
+        email_clean = email.strip()
 
-        with st.spinner("Looking up ZIP code…"):
-            zip_code = lookup_zip(school_name, country, territory_value, geocode, reverse, cache)
-            save_cache(cache, CACHE_FILE)
+        domain_label, domain_state = email_domain_hint(email_clean)
+        if domain_label or domain_state:
+            hint_desc = " / ".join(x for x in [domain_label, domain_state] if x)
+            st.caption(f"Using a hint from your email domain: {hint_desc}")
 
-        log_request(name.strip(), email.strip(), school_name.strip(), territory_value, country.strip(), zip_code)
+        try:
+            geocode, reverse = get_geocoder()
+            cache = get_cache()
 
-        if zip_code:
-            st.success(f"ZIP code for **{school_name.strip()}**: **{zip_code}**")
-        else:
-            st.warning(
-                f"Couldn't find a ZIP code for **{school_name.strip()}**. "
-                "Try checking the spelling, or add more detail (e.g. a city) to the school name."
+            with st.spinner("Looking up ZIP code…"):
+                zip_code = lookup_zip(
+                    school_name, country, territory_value, geocode, reverse, cache,
+                    email=email_clean,
+                )
+                save_cache(cache, CACHE_FILE)
+
+            log_request(name.strip(), email_clean, school_name.strip(), territory_value, country.strip(), zip_code)
+
+            if zip_code:
+                st.success(f"ZIP code for **{school_name.strip()}**: **{zip_code}**")
+            else:
+                st.warning(
+                    f"Couldn't find a ZIP code for **{school_name.strip()}**. "
+                    "Try checking the spelling, or add more detail (e.g. a city) to the school name."
+                )
+        except Exception:
+            # A geocoder hiccup (network issue, unexpected API response, etc.)
+            # should never surface as a raw traceback to the user — log it
+            # for debugging (visible in Streamlit Cloud's app logs) and show
+            # a plain message instead.
+            log.exception("Unhandled error while looking up %r", school_name)
+            st.error(
+                "Something went wrong while looking up this school. "
+                "Please try again in a moment — if it keeps happening, "
+                "let the app owner know."
             )
 
 with st.expander("Recent lookups"):
